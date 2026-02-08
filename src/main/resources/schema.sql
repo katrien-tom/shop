@@ -11,14 +11,15 @@
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS "order" (
     id BIGSERIAL PRIMARY KEY,
-    order_id VARCHAR(64) NOT NULL UNIQUE,
+    order_id VARCHAR(64) NOT NULL,
     sku_id BIGINT NOT NULL,
     quantity INT NOT NULL,
     amount DECIMAL(12, 2),
     status SMALLINT NOT NULL DEFAULT 1,
     trace_id VARCHAR(64),
     create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_order_id UNIQUE (order_id)
 );
 
 -- 订单表注释
@@ -34,9 +35,8 @@ COMMENT ON COLUMN "order".create_time IS '创建时间';
 COMMENT ON COLUMN "order".update_time IS '更新时间';
 
 -- 订单表索引
-CREATE INDEX idx_order_id ON "order"(order_id);
 CREATE INDEX idx_sku_id_order ON "order"(sku_id);
-CREATE INDEX idx_status ON "order"(status);
+CREATE INDEX idx_order_status ON "order"(status);
 CREATE INDEX idx_trace_id_order ON "order"(trace_id);
 
 -- =====================================================================
@@ -44,14 +44,18 @@ CREATE INDEX idx_trace_id_order ON "order"(trace_id);
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS stock (
     id BIGSERIAL PRIMARY KEY,
-    sku_id BIGINT NOT NULL UNIQUE,
+    sku_id BIGINT NOT NULL,
     total_stock INT NOT NULL DEFAULT 0,
     available_stock INT NOT NULL DEFAULT 0,
     locked_stock INT NOT NULL DEFAULT 0,
     version INT NOT NULL DEFAULT 0,
     create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_sku_id UNIQUE (sku_id)
+    CONSTRAINT uk_sku_id UNIQUE (sku_id),
+    CHECK (available_stock >= 0),
+    CHECK (locked_stock >= 0),
+    CHECK (total_stock >= 0),
+    CHECK (available_stock + locked_stock <= total_stock)
 );
 
 -- 库存表注释
@@ -65,87 +69,71 @@ COMMENT ON COLUMN stock.version IS '乐观锁版本号';
 COMMENT ON COLUMN stock.create_time IS '创建时间';
 COMMENT ON COLUMN stock.update_time IS '更新时间';
 
--- 库存表索引
-CREATE INDEX idx_stock_sku_id ON stock(sku_id);
+-- =====================================================================
+-- 库存扣减记录表 (stock_change_record)
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS stock_change_record (
+    id              BIGSERIAL PRIMARY KEY,
 
--- =====================================================================
--- 库存扣减记录表 (stock_operation)
--- =====================================================================
-CREATE TABLE IF NOT EXISTS stock_operation (
-    id BIGSERIAL PRIMARY KEY,
-    idempotent_id VARCHAR(64) NOT NULL UNIQUE,
-    sku_id BIGINT NOT NULL,
-    operate_type SMALLINT NOT NULL,
-    operate_status SMALLINT NOT NULL DEFAULT 0,
-    operate_num INT NOT NULL,
-    create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    remark VARCHAR(255),
-    CONSTRAINT uk_idempotent_id UNIQUE (idempotent_id)
+    -- 幂等与业务关联（核心防重字段）
+    idempotent_id   VARCHAR(64),                    -- 全局幂等键（支付回调、MQ消费、定时任务等场景使用）
+    business_id     VARCHAR(64) NOT NULL,           -- 订单号、退款单号、取消单号、补偿批次号等
+
+    sku_id          BIGINT NOT NULL,
+
+    -- 操作类型（建议扩展到 6~8 种，覆盖更多场景）
+    operation_type  SMALLINT NOT NULL,              -- 1=预扣减, 2=正式扣减, 3=库存释放,
+                                                    -- 4=补偿增加, 5=补偿扣减, 6=手动调整, 7=退货入库, 8=其他
+
+    quantity        INT NOT NULL CHECK (quantity >= 0),                   -- 操作数量
+
+    -- 库存快照（审计与对账核心）
+    available_before  INT NOT NULL,
+    available_after   INT NOT NULL,
+    locked_before     INT NOT NULL DEFAULT 0,
+    locked_after      INT NOT NULL DEFAULT 0,
+    total_before      INT NOT NULL DEFAULT 0,       -- 可选，如果业务关心总库存
+    total_after       INT NOT NULL DEFAULT 0,
+
+    -- 状态与结果
+    status          SMALLINT NOT NULL DEFAULT 0,    -- 0=处理中, 1=成功, 2=失败, 3=已补偿, 4=已回滚
+    error_message   TEXT,
+
+    -- 可观测性与追踪
+    trace_id        VARCHAR(64) NOT NULL,
+    operator        VARCHAR(64),                    -- 操作人/系统（可选：user_id / system / cron / mq-consumer 等）
+    remark          VARCHAR(255),
+
+    -- 补偿相关（当 operation_type 为补偿类时有意义）
+    compensation_reason  VARCHAR(64),               -- PAYMENT_TIMEOUT, ORDER_CANCELLED, RETURNED, SYSTEM_BUG, MANUAL 等
+
+    -- 时间
+    create_time     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    update_time     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,  -- 仅在极少数需要更新的场景使用（如人工补偿后改状态）
+
+    -- 唯一约束（根据实际幂等粒度选择 1~2 个）
+    CONSTRAINT uk_idempotent UNIQUE (idempotent_id) DEFERRABLE INITIALLY DEFERRED,  -- 允许部分记录 idempotent_id 为空
+    CONSTRAINT uk_business_type UNIQUE (business_id, operation_type) DEFERRABLE INITIALLY DEFERRED  -- 防同一个业务多次同类型操作
 );
 
--- 库存扣减记录表注释
-COMMENT ON TABLE stock_operation IS '库存扣减记录表';
-COMMENT ON COLUMN stock_operation.id IS '主键';
-COMMENT ON COLUMN stock_operation.idempotent_id IS '全局唯一幂等ID';
-COMMENT ON COLUMN stock_operation.sku_id IS 'skuID';
-COMMENT ON COLUMN stock_operation.operate_type IS '操作类型：1=PRE_DEDUCT(预扣减) 2=FORMAL_DEDUCT(正式扣减) 3=STOCK_RELEASE(库存释放)';
-COMMENT ON COLUMN stock_operation.operate_status IS '操作状态：0=PROCESSING(处理中) 1=SUCCESS(成功) 2=FAILED(失败)';
-COMMENT ON COLUMN stock_operation.operate_num IS '操作数量';
-COMMENT ON COLUMN stock_operation.create_time IS '创建时间';
-COMMENT ON COLUMN stock_operation.update_time IS '更新时间';
-COMMENT ON COLUMN stock_operation.remark IS '备注';
-
--- 库存扣减记录表索引
-CREATE INDEX idx_sku_id ON stock_operation(sku_id);
-
--- =====================================================================
--- 库存操作日志表 (stock_operation_log)
--- =====================================================================
-CREATE TABLE IF NOT EXISTS stock_operation_log (
-    id BIGSERIAL PRIMARY KEY,
-    business_id VARCHAR(64) NOT NULL,
-    sku_id BIGINT NOT NULL,
-    operation_type SMALLINT NOT NULL,
-    quantity INT NOT NULL,
-    stock_before INT NOT NULL,
-    stock_after INT NOT NULL,
-    status SMALLINT NOT NULL DEFAULT 0,
-    compensation_reason VARCHAR(64),
-    error_message TEXT,
-    trace_id VARCHAR(64) NOT NULL,
-    create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- 库存操作日志表注释
-COMMENT ON TABLE stock_operation_log IS '库存操作日志表，记录所有库存操作（扣减、补偿等），用于审计和幂等性验证';
-COMMENT ON COLUMN stock_operation_log.id IS '主键';
-COMMENT ON COLUMN stock_operation_log.business_id IS '业务ID（订单ID、库存操作ID等）';
-COMMENT ON COLUMN stock_operation_log.sku_id IS 'SKU ID';
-COMMENT ON COLUMN stock_operation_log.operation_type IS '操作类型：1=DEDUCT(扣减) 2=REFUND(退款) 3=COMPENSATION(补偿)';
-COMMENT ON COLUMN stock_operation_log.quantity IS '操作数量';
-COMMENT ON COLUMN stock_operation_log.stock_before IS '操作前库存';
-COMMENT ON COLUMN stock_operation_log.stock_after IS '操作后库存';
-COMMENT ON COLUMN stock_operation_log.status IS '操作状态：0=PENDING(待处理) 1=SUCCESS(成功) 2=FAILED(失败) 3=COMPENSATED(已补偿)';
-COMMENT ON COLUMN stock_operation_log.compensation_reason IS '补偿原因（当operation_type=3时有值）：PAYMENT_FAILED(支付失败) ORDER_CANCELLED(取消订单) ORDER_RETURNED(商品退货) SYSTEM_EXCEPTION(系统异常)';
-COMMENT ON COLUMN stock_operation_log.error_message IS '错误信息';
-COMMENT ON COLUMN stock_operation_log.trace_id IS '追踪ID（全链路追踪）';
-COMMENT ON COLUMN stock_operation_log.create_time IS '创建时间';
-COMMENT ON COLUMN stock_operation_log.update_time IS '更新时间';
-
--- 库存操作日志表索引
-CREATE INDEX idx_business_id ON stock_operation_log(business_id);
-CREATE INDEX idx_sku_id_log ON stock_operation_log(sku_id);
-CREATE INDEX idx_trace_id_log ON stock_operation_log(trace_id);
-CREATE INDEX idx_create_time ON stock_operation_log(create_time);
+-- 注释（强烈建议都加上，便于新人理解）
+COMMENT ON TABLE stock_change_record IS '库存变更记录表（合并幂等 + 审计日志），记录每一次库存操作的完整上下文，用于防重、审计、对账、补偿、问题定位';
+COMMENT ON COLUMN stock_change_record.idempotent_id          IS '幂等键（可为空，部分场景如手动调整无需幂等）';
+COMMENT ON COLUMN stock_change_record.business_id            IS '业务单据号（订单、退款单、补偿批次等）';
+COMMENT ON COLUMN stock_change_record.operation_type         IS '操作类型：1=预扣减 2=正式扣减 3=释放 4=补偿增加 5=补偿扣减 6=手动调整 7=退货入库';
+COMMENT ON COLUMN stock_change_record.quantity               IS '变更数量';
+COMMENT ON COLUMN stock_change_record.available_before       IS '操作前可用库存快照';
+COMMENT ON COLUMN stock_change_record.available_after        IS '操作后可用库存快照';
+COMMENT ON COLUMN stock_change_record.status                 IS '0=处理中 1=成功 2=失败 3=已补偿 4=已回滚';
+COMMENT ON COLUMN stock_change_record.compensation_reason    IS '补偿原因，仅补偿类操作有值';
+COMMENT ON COLUMN stock_change_record.trace_id               IS '全链路追踪ID';
 
 -- =====================================================================
 -- 消息投递记录表 (message_delivery)
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS message_delivery (
     id BIGSERIAL PRIMARY KEY,
-    message_id VARCHAR(64) NOT NULL UNIQUE,
+    message_id VARCHAR(64) NOT NULL,
     message_type SMALLINT NOT NULL,
     message_content TEXT NOT NULL,
     status SMALLINT NOT NULL DEFAULT 0,
@@ -156,7 +144,8 @@ CREATE TABLE IF NOT EXISTS message_delivery (
     trace_id VARCHAR(64),
     error_message TEXT,
     create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_message_id UNIQUE (message_id)
 );
 
 -- 消息投递记录表注释
@@ -176,8 +165,7 @@ COMMENT ON COLUMN message_delivery.create_time IS '创建时间';
 COMMENT ON COLUMN message_delivery.update_time IS '更新时间';
 
 -- 消息投递记录表索引
-CREATE INDEX idx_message_id ON message_delivery(message_id);
-CREATE INDEX idx_status ON message_delivery(status);
+CREATE INDEX idx_message_delivery_status ON message_delivery(status);
 CREATE INDEX idx_trace_id ON message_delivery(trace_id);
 CREATE INDEX idx_next_retry_time ON message_delivery(next_retry_time);
 

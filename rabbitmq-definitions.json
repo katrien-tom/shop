@@ -1,0 +1,28 @@
+{
+  "vhosts": [
+    { "name": "/" }
+  ],
+  "exchanges": [
+    { "name": "stock.deduct.exchange", "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "stock.deduct.dlx.exchange", "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "order.compensation.exchange", "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {} }
+  ],
+  "queues": [
+    { "name": "stock.deduct.queue", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {
+      "x-dead-letter-exchange": "stock.deduct.dlx.exchange",
+      "x-dead-letter-routing-key": "stock.deduct.dlx",
+      "x-message-ttl": 30000
+    }},
+    { "name": "stock.deduct.dlx.queue", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {
+      "x-dead-letter-exchange": "stock.deduct.exchange",
+      "x-dead-letter-routing-key": "stock.deduct",
+      "x-message-ttl": 10000
+    }},
+    { "name": "order.compensation.queue", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} }
+  ],
+  "bindings": [
+    { "source": "stock.deduct.exchange", "vhost": "/", "destination": "stock.deduct.queue", "destination_type": "queue", "routing_key": "stock.deduct", "arguments": {} },
+    { "source": "stock.deduct.dlx.exchange", "vhost": "/", "destination": "stock.deduct.dlx.queue", "destination_type": "queue", "routing_key": "stock.deduct.dlx", "arguments": {} },
+    { "source": "order.compensation.exchange", "vhost": "/", "destination": "order.compensation.queue", "destination_type": "queue", "routing_key": "order.compensation", "arguments": {} }
+  ]
+}
